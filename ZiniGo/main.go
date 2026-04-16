@@ -42,7 +42,7 @@ type LoginUser struct {
 
 // LibraryResponse is the paginated response from /api/newsstand/newsstands/101/users/{id}/library-issues
 type LibraryResponse struct {
-	Metadata LibraryMeta   `json:"metadata"`
+	Metadata LibraryMeta    `json:"metadata"`
 	Data     []LibraryIssue `json:"data"`
 }
 
@@ -53,9 +53,9 @@ type LibraryMeta struct {
 }
 
 type LibraryIssue struct {
-	Id          int             `json:"id"`
-	Name        string          `json:"name"`
-	Publication LibraryPub      `json:"publication"`
+	Id          int        `json:"id"`
+	Name        string     `json:"name"`
+	Publication LibraryPub `json:"publication"`
 }
 
 type LibraryPub struct {
@@ -98,9 +98,15 @@ type ZinioClient struct {
 }
 
 func newZinioClient(username, password, fingerprint string, newsstandID int) *ZinioClient {
-	jar, _ := cookiejar.New(nil)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		log.Fatalf("failed to create cookie jar: %v", err)
+	}
 	return &ZinioClient{
-		http:        &http.Client{Jar: jar},
+		http: &http.Client{
+			Jar:     jar,
+			Timeout: 30 * time.Second,
+		},
 		username:    username,
 		password:    password,
 		fingerprint: fingerprint,
@@ -110,9 +116,9 @@ func newZinioClient(username, password, fingerprint string, newsstandID int) *Zi
 
 func (z *ZinioClient) relogin() bool {
 	fmt.Println("Session expired, re-authenticating...")
-	resp := login(z.http, z.username, z.password, z.fingerprint, z.newsstandID)
-	if !resp.Status || resp.Data.User.UserIDString == "" {
-		fmt.Println("Re-login failed")
+	resp, err := login(z.http, z.username, z.password, z.fingerprint, z.newsstandID)
+	if err != nil || !resp.Status || resp.Data.User.UserIDString == "" {
+		fmt.Println("Re-login failed:", err)
 		return false
 	}
 	z.userID = resp.Data.User.UserIDString
@@ -135,7 +141,10 @@ func main() {
 
 	if fileExists(mydir + "/config.json") {
 		fmt.Println("Config file loaded")
-		byteValue, _ := ioutil.ReadFile("config.json")
+		byteValue, readErr := ioutil.ReadFile("config.json")
+		if readErr != nil {
+			log.Fatalf("failed to read config.json: %v", readErr)
+		}
 
 		if u := gjson.GetBytes(byteValue, "username"); u.Exists() {
 			*usernamePtr = u.String()
@@ -164,22 +173,30 @@ func main() {
 
 	zc := newZinioClient(*usernamePtr, *passwordPtr, *deviceFingerprintPtr, *newsstandIDPtr)
 
-	loginResp := login(zc.http, zc.username, zc.password, zc.fingerprint, zc.newsstandID)
+	loginResp, loginErr := login(zc.http, zc.username, zc.password, zc.fingerprint, zc.newsstandID)
+	if loginErr != nil {
+		log.Fatalf("Login failed: %v", loginErr)
+	}
 	if !loginResp.Status || loginResp.Data.User.UserIDString == "" {
-		log.Fatal("Login failed")
+		log.Fatal("Login failed: server returned status=false")
 	}
 	zc.userID = loginResp.Data.User.UserIDString
 	fmt.Println("Logged in as:", loginResp.Data.User.Email, "| UserID:", zc.userID)
 
 	issueDirectory := filepath.Join(mydir, "issue")
 	if _, statErr := os.Stat(issueDirectory); os.IsNotExist(statErr) {
-		os.Mkdir(issueDirectory, 0700)
+		if mkdirErr := os.Mkdir(issueDirectory, 0700); mkdirErr != nil {
+			log.Fatalf("unable to create issue directory %q: %v", issueDirectory, mkdirErr)
+		}
 	}
 
 	offset := 0
 	pageSize := 120
 	for {
-		library := zc.fetchLibrary(pageSize, offset)
+		library, fetchErr := zc.fetchLibrary(pageSize, offset)
+		if fetchErr != nil {
+			log.Fatalf("Library fetch failed: %v", fetchErr)
+		}
 		if len(library.Data) == 0 {
 			break
 		}
@@ -207,11 +224,10 @@ func main() {
 
 			issuePath := filepath.Join(issueDirectory, strconv.Itoa(issue.Id))
 
-			passwords := []string{legacyHash, hash, ""}
-			// deduplicate
+			// Build deduplicated password list to try: legacy_hash → hash → unencrypted
 			seen := map[string]bool{}
 			var uniquePasswords []string
-			for _, pw := range passwords {
+			for _, pw := range []string{legacyHash, hash, ""} {
 				if !seen[pw] {
 					seen[pw] = true
 					uniquePasswords = append(uniquePasswords, pw)
@@ -226,9 +242,14 @@ func main() {
 				encPath := issuePath + "_" + page.Index + "_enc.pdf"
 				decPath := issuePath + "_" + page.Index + ".pdf"
 
-				resp, dlErr := http.Get(page.Src)
+				resp, dlErr := zc.http.Get(page.Src)
 				if dlErr != nil {
 					fmt.Printf("Failed to download page %s: %s\n", page.Index, dlErr)
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					fmt.Printf("Non-200 response for page %s: %d\n", page.Index, resp.StatusCode)
 					continue
 				}
 				data, readErr := ioutil.ReadAll(resp.Body)
@@ -256,24 +277,32 @@ func main() {
 				filenames = append(filenames, decPath)
 			}
 
+			skipMerge := false
 			for i := range filenames {
-				retry(5, 2*time.Second, func() error {
+				if retryErr := retry(5, 2*time.Second, func() error {
 					err := api.RemovePagesFile(filenames[i], "", []string{"2-"}, nil)
 					if err != nil {
 						fmt.Printf("Removing extra pages failed: %s\n", err)
 					}
 					return err
-				})
+				}); retryErr != nil {
+					fmt.Printf("Skipping merge for %s after repeated RemovePages failure: %s\n", completeName, retryErr)
+					skipMerge = true
+					break
+				}
 			}
 
-			if mergeErr := api.MergeCreateFile(filenames, completeName, nil); mergeErr != nil {
-				fmt.Printf("Merge failed for %s: %s\n", completeName, mergeErr)
+			if !skipMerge {
+				if mergeErr := api.MergeCreateFile(filenames, completeName, nil); mergeErr != nil {
+					fmt.Printf("Merge failed for %s: %s\n", completeName, mergeErr)
+				} else {
+					fmt.Println("Saved:", completeName)
+				}
 			}
 
 			for _, fileName := range filenames {
 				os.Remove(fileName)
 			}
-			fmt.Println("Saved:", completeName)
 		}
 
 		offset += len(library.Data)
@@ -282,11 +311,10 @@ func main() {
 		}
 	}
 
-
 	fmt.Println("Done.")
 }
 
-func login(client *http.Client, username, password, fingerprint string, newsstandID int) LoginResponse {
+func login(client *http.Client, username, password, fingerprint string, newsstandID int) (LoginResponse, error) {
 	fmt.Println("Logging in...")
 
 	payload := map[string]interface{}{
@@ -304,9 +332,15 @@ func login(client *http.Client, username, password, fingerprint string, newsstan
 			"userCurrency": "USD",
 		},
 	}
-	body, _ := json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("failed to marshal login payload: %w", err)
+	}
 
-	req, _ := http.NewRequest("POST", zinioBase+"/api/x7b9q-sync", bytes.NewBuffer(body))
+	req, err := http.NewRequest("POST", zinioBase+"/api/x7b9q-sync", bytes.NewBuffer(body))
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("failed to create login request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Origin", zinioBase)
@@ -314,50 +348,69 @@ func login(client *http.Client, username, password, fingerprint string, newsstan
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalf("Login request failed: %v", err)
+		return LoginResponse{}, fmt.Errorf("login request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("Login response:", string(data))
+	if resp.StatusCode != http.StatusOK {
+		return LoginResponse{}, fmt.Errorf("login returned HTTP %d", resp.StatusCode)
+	}
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("failed to read login response: %w", err)
+	}
 
 	var result LoginResponse
-	json.Unmarshal(data, &result)
-	return result
+	if err := json.Unmarshal(data, &result); err != nil {
+		return LoginResponse{}, fmt.Errorf("failed to parse login response: %w", err)
+	}
+	return result, nil
 }
 
-func (z *ZinioClient) fetchLibrary(limit, offset int) LibraryResponse {
+func (z *ZinioClient) fetchLibrary(limit, offset int) (LibraryResponse, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		u := fmt.Sprintf("%s/api/newsstand/newsstands/%d/users/%s/library-issues?limit=%d&offset=%d&sort=desc",
 			zinioBase, z.newsstandID, z.userID, limit, offset)
 
-		req, _ := http.NewRequest("GET", u, nil)
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return LibraryResponse{}, fmt.Errorf("failed to create library request: %w", err)
+		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 		req.Header.Set("Origin", zinioBase)
 
 		resp, err := z.http.Do(req)
 		if err != nil {
-			fmt.Println("Library fetch failed:", err)
-			return LibraryResponse{}
+			return LibraryResponse{}, fmt.Errorf("library request failed: %w", err)
 		}
 
-		data, _ := ioutil.ReadAll(resp.Body)
+		data, readErr := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			return LibraryResponse{}, fmt.Errorf("failed to read library response: %w", readErr)
+		}
 
 		if resp.StatusCode == 401 && attempt == 0 {
 			fmt.Println("Library 401, re-authenticating...")
 			if !z.relogin() {
-				return LibraryResponse{}
+				return LibraryResponse{}, fmt.Errorf("re-authentication failed")
 			}
 			continue
 		}
 
+		if resp.StatusCode != http.StatusOK {
+			return LibraryResponse{}, fmt.Errorf("library returned HTTP %d", resp.StatusCode)
+		}
+
 		fmt.Println("Library response:", string(data)[:min(len(string(data)), 200)])
 		var result LibraryResponse
-		json.Unmarshal(data, &result)
-		return result
+		if err := json.Unmarshal(data, &result); err != nil {
+			return LibraryResponse{}, fmt.Errorf("failed to parse library response: %w", err)
+		}
+		return result, nil
 	}
-	return LibraryResponse{}
+	return LibraryResponse{}, fmt.Errorf("library fetch failed after re-authentication")
 }
 
 func (z *ZinioClient) fetchReaderContent(issueID int) ReaderContent {
@@ -365,18 +418,26 @@ func (z *ZinioClient) fetchReaderContent(issueID int) ReaderContent {
 		u := fmt.Sprintf("%s/api/reader/content?issue_id=%d&newsstand_id=%d&user_id=%s",
 			zinioBase, issueID, z.newsstandID, url.QueryEscape(z.userID))
 
-		req, _ := http.NewRequest("GET", u, nil)
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			fmt.Printf("Failed to create reader request for issue %d: %v\n", issueID, err)
+			return ReaderContent{}
+		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 		req.Header.Set("Origin", zinioBase)
 
 		resp, err := z.http.Do(req)
 		if err != nil {
-			fmt.Println("Reader content fetch failed:", err)
+			fmt.Printf("Reader content fetch failed for issue %d: %v\n", issueID, err)
 			return ReaderContent{}
 		}
 
-		data, _ := ioutil.ReadAll(resp.Body)
+		data, readErr := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			fmt.Printf("Failed to read reader response for issue %d: %v\n", issueID, readErr)
+			return ReaderContent{}
+		}
 
 		if resp.StatusCode == 401 && attempt == 0 {
 			fmt.Println("Reader 401, re-authenticating...")
@@ -386,8 +447,16 @@ func (z *ZinioClient) fetchReaderContent(issueID int) ReaderContent {
 			continue
 		}
 
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Reader returned HTTP %d for issue %d\n", resp.StatusCode, issueID)
+			return ReaderContent{}
+		}
+
 		var result ReaderContent
-		json.Unmarshal(data, &result)
+		if err := json.Unmarshal(data, &result); err != nil {
+			fmt.Printf("Failed to parse reader response for issue %d: %v\n", issueID, err)
+			return ReaderContent{}
+		}
 		fmt.Printf("Issue %d: %d pages\n", issueID, len(result.Data.Pages))
 		return result
 	}
