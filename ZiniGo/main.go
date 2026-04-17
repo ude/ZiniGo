@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/icza/gox/stringsx"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"io/ioutil"
@@ -115,15 +115,20 @@ func newZinioClient(username, password, fingerprint string, newsstandID int) *Zi
 }
 
 func (z *ZinioClient) relogin() bool {
-	fmt.Println("Session expired, re-authenticating...")
-	resp, err := login(z.http, z.username, z.password, z.fingerprint, z.newsstandID)
-	if err != nil || !resp.Status || resp.Data.User.UserIDString == "" {
-		fmt.Println("Re-login failed:", err)
-		return false
+	delays := []time.Duration{5 * time.Second, 15 * time.Second, 60 * time.Second}
+	for attempt, delay := range delays {
+		fmt.Printf("Re-authenticating (attempt %d/%d)...\n", attempt+1, len(delays))
+		resp, err := login(z.http, z.username, z.password, z.fingerprint, z.newsstandID)
+		if err == nil && resp.Status && resp.Data.User.UserIDString != "" {
+			z.userID = resp.Data.User.UserIDString
+			fmt.Println("Re-authenticated as:", resp.Data.User.Email)
+			return true
+		}
+		fmt.Printf("Re-login failed: %v — waiting %s before retry\n", err, delay)
+		time.Sleep(delay)
 	}
-	z.userID = resp.Data.User.UserIDString
-	fmt.Println("Re-authenticated as:", resp.Data.User.Email)
-	return true
+	fmt.Println("Re-authentication failed after all attempts")
+	return false
 }
 
 func main() {
@@ -195,7 +200,10 @@ func main() {
 	for {
 		library, fetchErr := zc.fetchLibrary(pageSize, offset)
 		if fetchErr != nil {
-			log.Fatalf("Library fetch failed: %v", fetchErr)
+			// Transient failure — wait and retry rather than aborting the whole run
+			fmt.Printf("Library fetch failed: %v — waiting 60s before retry\n", fetchErr)
+			time.Sleep(60 * time.Second)
+			continue
 		}
 		if len(library.Data) == 0 {
 			break
@@ -262,7 +270,7 @@ func main() {
 
 				decrypted := false
 				for _, pw := range uniquePasswords {
-					conf := pdfcpu.NewAESConfiguration(pw, pw, 256)
+					conf := model.NewAESConfiguration(pw, pw, 256)
 					if decErr := api.DecryptFile(encPath, decPath, conf); decErr == nil {
 						decrypted = true
 						break
@@ -293,7 +301,7 @@ func main() {
 			}
 
 			if !skipMerge {
-				if mergeErr := api.MergeCreateFile(filenames, completeName, nil); mergeErr != nil {
+				if mergeErr := api.MergeCreateFile(filenames, completeName, false, nil); mergeErr != nil {
 					fmt.Printf("Merge failed for %s: %s\n", completeName, mergeErr)
 				} else {
 					fmt.Println("Saved:", completeName)
