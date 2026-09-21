@@ -5,11 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/icza/gox/stringsx"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -21,7 +16,104 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/icza/gox/stringsx"
+	"github.com/klippa-app/go-pdfium"
+	"github.com/klippa-app/go-pdfium/references"
+	"github.com/klippa-app/go-pdfium/requests"
+	"github.com/klippa-app/go-pdfium/webassembly"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
+
+// PDFium (Chrome's PDF engine, embedded as WebAssembly) handles the page
+// PDFs Zinio serves: decryption, page extraction and merging. pdfcpu was
+// abandoned because it corrupted these files in several independent ways
+// (dropped font objects and OCGs, missed inline /Encrypt dicts, broken
+// object-stream output).
+var (
+	pdfPool     pdfium.Pool
+	pdfInstance pdfium.Pdfium
+)
+
+func initPdfium() {
+	var err error
+	pdfPool, err = webassembly.Init(webassembly.Config{MinIdle: 1, MaxIdle: 1, MaxTotal: 1})
+	if err != nil {
+		log.Fatalf("failed to init PDFium: %v", err)
+	}
+	pdfInstance, err = pdfPool.GetInstance(30 * time.Second)
+	if err != nil {
+		log.Fatalf("failed to get PDFium instance: %v", err)
+	}
+}
+
+// openWithPasswords opens a page PDF trying each password candidate in order.
+func openWithPasswords(path string, passwords []string) (references.FPDF_DOCUMENT, error) {
+	var lastErr error
+	for _, pw := range passwords {
+		p := pw
+		resp, err := pdfInstance.OpenDocument(&requests.OpenDocument{FilePath: &path, Password: &p})
+		if err == nil {
+			return resp.Document, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+func closeDoc(doc references.FPDF_DOCUMENT) {
+	pdfInstance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc})
+}
+
+// mergeIssue builds the final magazine PDF: the first page of every page
+// file, in order, into one document.
+func mergeIssue(pagePaths []string, outPath string, passwords []string) error {
+	dest, err := pdfInstance.FPDF_CreateNewDocument(&requests.FPDF_CreateNewDocument{})
+	if err != nil {
+		return fmt.Errorf("create document: %w", err)
+	}
+	defer closeDoc(dest.Document)
+
+	for i, p := range pagePaths {
+		src, err := openWithPasswords(p, passwords)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", p, err)
+		}
+		_, err = pdfInstance.FPDF_ImportPagesByIndex(&requests.FPDF_ImportPagesByIndex{
+			Source:      src,
+			Destination: dest.Document,
+			PageIndices: []int{0},
+			Index:       i,
+		})
+		closeDoc(src)
+		if err != nil {
+			return fmt.Errorf("import %s: %w", p, err)
+		}
+	}
+
+	// Zinio pages carry a sticky-note annotation with the page number —
+	// noise in the final magazine, so strip all annotations.
+	for i := range pagePaths {
+		page := requests.Page{ByIndex: &requests.PageByIndex{Document: dest.Document, Index: i}}
+		cnt, err := pdfInstance.FPDFPage_GetAnnotCount(&requests.FPDFPage_GetAnnotCount{Page: page})
+		if err != nil {
+			continue
+		}
+		for a := cnt.Count - 1; a >= 0; a-- {
+			pdfInstance.FPDFPage_RemoveAnnot(&requests.FPDFPage_RemoveAnnot{Page: page, Index: a})
+		}
+	}
+
+	if _, err := pdfInstance.FPDF_SaveAsCopy(&requests.FPDF_SaveAsCopy{
+		Flags:    requests.SaveFlagNoIncremental,
+		Document: dest.Document,
+		FilePath: &outPath,
+	}); err != nil {
+		return fmt.Errorf("save %s: %w", outPath, err)
+	}
+	return nil
+}
 
 const zinioBase = "https://www.zinio.com"
 
@@ -136,8 +228,14 @@ func main() {
 	passwordPtr := flag.String("p", "", "Zinio Password")
 	deviceFingerprintPtr := flag.String("fingerprint", "abcd123", "Device fingerprint")
 	newsstandIDPtr := flag.Int("ns", 101, "Newsstand ID")
+	onlyIssuePtr := flag.Int("issue", 0, "Only process this issue ID (0 = all)")
+	keepPagesPtr := flag.Bool("keeppages", false, "Keep per-page PDFs after merging (debugging)")
 
 	flag.Parse()
+
+	initPdfium()
+	defer pdfPool.Close()
+	defer pdfInstance.Close()
 
 	mydir, err := os.Getwd()
 	if err != nil {
@@ -211,6 +309,9 @@ func main() {
 		fmt.Printf("Fetched %d issues (offset %d)\n", len(library.Data), offset)
 
 		for _, issue := range library.Data {
+			if *onlyIssuePtr != 0 && issue.Id != *onlyIssuePtr {
+				continue
+			}
 			pubName := RemoveBadCharacters(issue.Publication.Name)
 			issueName := RemoveBadCharacters(issue.Name)
 			completeName := filepath.Join(issueDirectory, pubName+" - "+issueName+".pdf")
@@ -243,73 +344,49 @@ func main() {
 			}
 
 			var filenames []string
+			issueFailed := false
 			for _, page := range content.Data.Pages {
 				if page.Src == "" {
 					continue
 				}
-				encPath := issuePath + "_" + page.Index + "_enc.pdf"
-				decPath := issuePath + "_" + page.Index + ".pdf"
+				pagePath := issuePath + "_" + page.Index + ".pdf"
 
-				resp, dlErr := zc.http.Get(page.Src)
-				if dlErr != nil {
-					fmt.Printf("Failed to download page %s: %s\n", page.Index, dlErr)
-					continue
-				}
-				if resp.StatusCode != http.StatusOK {
-					resp.Body.Close()
-					fmt.Printf("Non-200 response for page %s: %d\n", page.Index, resp.StatusCode)
-					continue
-				}
-				data, readErr := ioutil.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr != nil {
-					fmt.Printf("Failed to read page %s: %s\n", page.Index, readErr)
-					continue
-				}
-				ioutil.WriteFile(encPath, data, 0644)
-
-				decrypted := false
-				for _, pw := range uniquePasswords {
-					conf := model.NewAESConfiguration(pw, pw, 256)
-					if decErr := api.DecryptFile(encPath, decPath, conf); decErr == nil {
-						decrypted = true
+				var pageErr error
+				for attempt := 0; attempt < 2; attempt++ {
+					pageErr = zc.fetchPage(page, pagePath, uniquePasswords)
+					if pageErr == nil {
 						break
 					}
+					fmt.Printf("Page %s failed (attempt %d): %v\n", page.Index, attempt+1, pageErr)
 				}
-				if decrypted {
-					os.Remove(encPath)
-				} else {
-					// PDF is not encrypted or uses unknown encryption — use as-is
-					os.Rename(encPath, decPath)
-				}
-				filenames = append(filenames, decPath)
-			}
-
-			skipMerge := false
-			for i := range filenames {
-				if retryErr := retry(5, 2*time.Second, func() error {
-					err := api.RemovePagesFile(filenames[i], "", []string{"2-"}, nil)
-					if err != nil {
-						fmt.Printf("Removing extra pages failed: %s\n", err)
-					}
-					return err
-				}); retryErr != nil {
-					fmt.Printf("Skipping merge for %s after repeated RemovePages failure: %s\n", completeName, retryErr)
-					skipMerge = true
+				if pageErr != nil {
+					fmt.Printf("Giving up on issue %d at page %s: %v\n", issue.Id, page.Index, pageErr)
+					fmt.Printf("  Decryption diagnostics: hash=%q legacy_hash=%q legacy_content=%d\n",
+						hash, legacyHash, content.Data.Issue.Publication.LegacyContent)
+					issueFailed = true
 					break
 				}
+				filenames = append(filenames, pagePath)
 			}
 
-			if !skipMerge {
-				if mergeErr := api.MergeCreateFile(filenames, completeName, false, nil); mergeErr != nil {
-					fmt.Printf("Merge failed for %s: %s\n", completeName, mergeErr)
-				} else {
-					fmt.Println("Saved:", completeName)
+			if issueFailed {
+				fmt.Printf("Skipping %s: not all pages could be downloaded correctly\n", completeName)
+				for _, fileName := range filenames {
+					os.Remove(fileName)
 				}
+				continue
 			}
 
-			for _, fileName := range filenames {
-				os.Remove(fileName)
+			if mergeErr := mergeIssue(filenames, completeName, uniquePasswords); mergeErr != nil {
+				fmt.Printf("Merge failed for %s: %s\n", completeName, mergeErr)
+			} else {
+				fmt.Println("Saved:", completeName)
+			}
+
+			if !*keepPagesPtr {
+				for _, fileName := range filenames {
+					os.Remove(fileName)
+				}
 			}
 		}
 
@@ -423,7 +500,7 @@ func (z *ZinioClient) fetchLibrary(limit, offset int) (LibraryResponse, error) {
 
 func (z *ZinioClient) fetchReaderContent(issueID int) ReaderContent {
 	for attempt := 0; attempt < 2; attempt++ {
-		u := fmt.Sprintf("%s/api/reader/content?issue_id=%d&newsstand_id=%d&user_id=%s",
+		u := fmt.Sprintf("%s/api/reader/content?issue_id=%d&newsstand_id=%d&user_id=%s&format=pdf",
 			zinioBase, issueID, z.newsstandID, url.QueryEscape(z.userID))
 
 		req, err := http.NewRequest("GET", u, nil)
@@ -465,10 +542,62 @@ func (z *ZinioClient) fetchReaderContent(issueID int) ReaderContent {
 			fmt.Printf("Failed to parse reader response for issue %d: %v\n", issueID, err)
 			return ReaderContent{}
 		}
-		fmt.Printf("Issue %d: %d pages\n", issueID, len(result.Data.Pages))
+		if len(result.Data.Pages) == 0 {
+			fmt.Printf("Issue %d: 0 pages — raw response: %s\n", issueID, string(data)[:min(len(data), 300)])
+		} else {
+			fmt.Printf("Issue %d: %d pages\n", issueID, len(result.Data.Pages))
+		}
 		return result
 	}
 	return ReaderContent{}
+}
+
+// fetchPage downloads one page PDF (with retries for transient CDN failures)
+// and verifies PDFium can open it with one of the password candidates.
+func (z *ZinioClient) fetchPage(page ReaderPage, pagePath string, passwords []string) error {
+	var data []byte
+	delays := []time.Duration{0, 5 * time.Second, 15 * time.Second}
+	var lastErr error
+	for _, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		resp, err := z.http.Get(page.Src)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, readErr := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		data = body
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return fmt.Errorf("download failed: %w", lastErr)
+	}
+
+	if err := ioutil.WriteFile(pagePath, data, 0644); err != nil {
+		return err
+	}
+
+	doc, err := openWithPasswords(pagePath, passwords)
+	if err != nil {
+		// Keep the failing file for inspection instead of deleting it
+		corruptPath := pagePath + ".corrupt.pdf"
+		os.Rename(pagePath, corruptPath)
+		return fmt.Errorf("PDFium cannot open page: %v (kept at %s)", err, corruptPath)
+	}
+	closeDoc(doc)
+	return nil
 }
 
 func fileExists(filename string) bool {
@@ -481,20 +610,6 @@ func fileExists(filename string) bool {
 		return true
 	}
 	return !info.IsDir()
-}
-
-func retry(attempts int, sleep time.Duration, f func() error) error {
-	for i := 0; ; i++ {
-		err := f()
-		if err == nil {
-			return nil
-		}
-		if i >= attempts-1 {
-			return fmt.Errorf("after %d attempts, last error: %s", attempts, err)
-		}
-		time.Sleep(sleep)
-		fmt.Println("retrying after error:", err)
-	}
 }
 
 var badCharacters = []string{"/", "\\", "<", ">", ":", "\"", "|", "?", "*"}
