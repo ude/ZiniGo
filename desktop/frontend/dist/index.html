@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZiniGo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="login-view" class="view">
+    <div class="login-card">
+      <h1>ZiniGo</h1>
+      <p class="subtitle">Tus revistas de Zinio, sin DRM</p>
+      <form id="login-form">
+        <input type="email" id="username" placeholder="Email de Zinio" autocomplete="username" required />
+        <input type="password" id="password" placeholder="Contraseña" autocomplete="current-password" />
+        <label class="remember"><input type="checkbox" id="remember" checked /> Recordar credenciales</label>
+        <button type="submit" id="login-btn">Entrar</button>
+        <p id="login-error" class="error"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="library-view" class="view hidden">
+    <header>
+      <h1>ZiniGo</h1>
+      <span id="user-email" class="muted"></span>
+      <div class="spacer"></div>
+      <button id="download-all-btn" class="secondary">Descargar todas</button>
+      <button id="folder-btn" class="secondary" title="Abrir carpeta de descargas">📂 Carpeta</button>
+      <button id="choose-folder-btn" class="secondary" title="Cambiar carpeta de descargas">⚙️</button>
+    </header>
+    <p id="folder-path" class="muted folder-path"></p>
+    <div id="grid" class="grid"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
