@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,8 +49,11 @@ func (a *App) startup(ctx context.Context) {
 	if data, err := os.ReadFile(configPath()); err == nil {
 		json.Unmarshal(data, &a.cfg)
 	}
+	// Reuse the CLI's default fingerprint: Zinio registers every new
+	// fingerprint as a device and returns 403 once the account hits its
+	// device limit, so generating a random one per install locks users out.
 	if a.cfg.Fingerprint == "" {
-		a.cfg.Fingerprint = randSeq(15)
+		a.cfg.Fingerprint = "abcd123"
 	}
 	if a.cfg.DownloadDir == "" {
 		home, _ := os.UserHomeDir()
@@ -225,14 +227,4 @@ func (a *App) OpenDownloadDir() {
 // OpenFile opens a downloaded magazine with the system PDF viewer.
 func (a *App) OpenFile(path string) {
 	runtime.BrowserOpenURL(a.ctx, "file://"+path)
-}
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
 }
